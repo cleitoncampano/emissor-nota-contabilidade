@@ -1,6 +1,6 @@
 # Publicar na conta cleitoncampano
 
-Execute os comandos na pasta `emissor-nfse`, que tem seu próprio Git. O nome previsto é `cleitoncampano/emissor-nfse` e a branch é `main`.
+Execute os comandos na pasta local `emissor-nfse`, que tem seu próprio Git. Após clonar pelo GitHub, a pasta se chama `emissor-nota-contabilidade`. O nome previsto é `cleitoncampano/emissor-nota-contabilidade` e a branch é `main`.
 
 ## Autenticar
 
@@ -27,10 +27,10 @@ O primeiro commit foi preparado sem os dados operacionais, certificados, convite
 
 ## Criar e enviar
 
-O `origin` local já aponta para `https://github.com/cleitoncampano/emissor-nfse.git`. Crie o repositório vazio e depois envie o commit:
+O `origin` local já aponta para `https://github.com/cleitoncampano/emissor-nota-contabilidade.git`. Crie o repositório vazio e depois envie o commit:
 
 ```bash
-gh repo create cleitoncampano/emissor-nfse --public --description "Conector MCP de NFS-e Nacional para equipes contábeis no Windows"
+gh repo create cleitoncampano/emissor-nota-contabilidade --public --description "Conector MCP de NFS-e Nacional para equipes contábeis no Windows"
 git push -u origin main
 ```
 

@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import base64
 import gzip
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
 from pynfse_nacional import NFSeClient
 from pynfse_nacional.constants import ENDPOINTS
+from pynfse_nacional.error_codes import ErrorCode
+from pynfse_nacional.exceptions import NFSeAPIError
 from pynfse_nacional.models import EventResponse, NFSeResponse
 from pynfse_nacional.utils import compress_encode
 
@@ -69,6 +72,34 @@ class ClienteSefin(NFSeClient):
         self.ambiente_nome = ambiente
         # Com procuração, o certificado é do escritório e as consultas precisam dizer de qual cliente são.
         self.cnpj_consulta = cnpj_consulta
+        self._profundidade_sessao = 0
+        self._ctx_sessao = None
+        self._cliente_sessao: Optional[httpx.Client] = None
+
+    def __enter__(self) -> ClienteSefin:
+        self._profundidade_sessao += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._profundidade_sessao = max(0, self._profundidade_sessao - 1)
+        if self._profundidade_sessao == 0 and self._ctx_sessao is not None:
+            ctx = self._ctx_sessao
+            self._ctx_sessao = None
+            self._cliente_sessao = None
+            ctx.__exit__(*exc)
+
+    @contextmanager
+    def _get_client(self):
+        if self._profundidade_sessao <= 0:
+            with super()._get_client() as cliente:
+                yield cliente
+            return
+        if self._cliente_sessao is None:
+            ctx = super()._get_client()
+            cliente = ctx.__enter__()
+            self._ctx_sessao = ctx
+            self._cliente_sessao = cliente
+        yield self._cliente_sessao
 
     def assinar(self, xml: str) -> str:
         return self._xml_signer.sign(xml)
@@ -87,9 +118,20 @@ class ClienteSefin(NFSeClient):
     def registrar_evento(self, chave: str, xml_assinado: str) -> EventResponse:
         url = f"{self.base_url}{ENDPOINTS['events'].format(chave=chave)}"
         payload = {"pedidoRegistroEventoXmlGZipB64": compress_encode(xml_assinado)}
-        with self._get_client() as cliente:
-            resposta = cliente.post(url, json=payload)
-            return self._parse_event_response(resposta)
+        try:
+            with self._get_client() as cliente:
+                resposta = cliente.post(url, json=payload)
+                return self._parse_event_response(resposta)
+        except httpx.TimeoutException as exc:
+            raise NFSeAPIError(
+                "Tempo esgotado ao registrar evento na SEFIN.",
+                code=ErrorCode.COMMUNICATION_TIMEOUT,
+            ) from exc
+        except httpx.RequestError as exc:
+            raise NFSeAPIError(
+                f"Erro de comunicação ao registrar evento ({type(exc).__name__}).",
+                code=ErrorCode.COMMUNICATION_ERROR,
+            ) from exc
 
     def distribuicao(self, nsu: int) -> tuple[str, list[DocumentoDistribuido], list[str]]:
         """Busca documentos (notas emitidas, recebidas e eventos) a partir de um NSU.
@@ -99,10 +141,15 @@ class ClienteSefin(NFSeClient):
         base = ADN_CONTRIBUINTES[self.ambiente_nome]
         url = f"{base}/DFe/{int(nsu)}"
         extra = {"cnpjConsulta": self.cnpj_consulta} if self.cnpj_consulta else {}
-        with self._get_client() as cliente:
-            resposta = cliente.get(url, params={"lote": "true", **extra})
-            if resposta.status_code == 400:
-                resposta = cliente.get(url, params=extra)
+        try:
+            with self._get_client() as cliente:
+                resposta = cliente.get(url, params={"lote": "true", **extra})
+                if resposta.status_code == 400:
+                    resposta = cliente.get(url, params=extra)
+        except httpx.TimeoutException:
+            return "erro", [], ["Tempo esgotado ao consultar o Ambiente de Dados Nacional."]
+        except httpx.RequestError as exc:
+            return "erro", [], [f"Erro de comunicação com o Ambiente de Dados Nacional ({type(exc).__name__})."]
         if resposta.status_code == 404:
             return "vazio", [], []
         try:
@@ -144,8 +191,7 @@ class ClienteSefin(NFSeClient):
         url = f"{self.parametrizacao_url}/{int(codigo_municipio):07d}/{codigo_servico}"
         try:
             with self._get_client() as cliente:
-                cliente.timeout = httpx.Timeout(8.0)
-                resposta = cliente.get(url)
+                resposta = cliente.get(url, timeout=8.0)
             if resposta.status_code != 200:
                 return None
             dados = resposta.json()

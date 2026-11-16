@@ -13,6 +13,7 @@ Regras seguidas (Anexo I, RN DPS_NFS-e, v1.01 de 09/02/2026):
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -111,7 +112,7 @@ def validar_documento(doc: str) -> str:
 
 def competencia_para_data(texto: Optional[str], hoje: Optional[date] = None) -> date:
     """Aceita '2026-10', '10/2026', '2026-10-15' ou '15/10/2026'. Mês sem dia vira o último dia do mês (limitado a hoje)."""
-    hoje = hoje or datetime.now(FUSO_BR).date()
+    hoje = hoje or agora_emissao().date()
     if not texto:
         return hoje
     t = texto.strip()
@@ -226,8 +227,8 @@ def conferir_regras(empresa: Empresa, dados: DadosNota) -> Calculo:
                 f"Informe aliquota_iss_simples no cadastro de {empresa.nome}."
             )
         aliquota = dec(empresa.aliquota_iss_simples)
-        if aliquota > 5:
-            raise ErroNota("Alíquota de ISS acima de 5% não é aceita (regra E0595).")
+        if aliquota < 0 or aliquota > 5:
+            raise ErroNota("Alíquota de ISS deve ficar entre 0% e 5% (regra E0595).")
         iss_estimado = q2(dados.valor * aliquota / 100)
     elif dados.iss_retido:
         avisos.append("ISS retido: o valor é calculado pelo sistema nacional com a alíquota cadastrada pela prefeitura.")
@@ -315,9 +316,10 @@ def montar_dps(
     _sub(cserv, "xDescServ", dados.descricao.strip())
     if dados.nbs:
         _sub(cserv, "cNBS", dados.nbs)
-    if dados.observacao:
+    obs = (dados.observacao or "").strip()
+    if obs:
         compl = _sub(serv, "infoCompl")
-        _sub(compl, "xInfComp", dados.observacao.strip())
+        _sub(compl, "xInfComp", obs)
 
     valores = _sub(inf, "valores")
     vserv = _sub(valores, "vServPrest")
@@ -391,6 +393,9 @@ def montar_cancelamento(empresa: Empresa, chave: str, codigo: int, motivo: str, 
     return ET.tostring(raiz, encoding="unicode", xml_declaration=False)
 
 
+_ESQUEMA_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=2)
 def _esquema(nome: str) -> etree.XMLSchema:
     caminho = RECURSOS / "xsd" / nome
@@ -404,6 +409,8 @@ def validar_xsd(xml: str, tipo: str = "dps") -> list[str]:
     if dados.startswith(b"<?xml"):
         dados = dados.split(b"?>", 1)[1].lstrip()
     doc = etree.fromstring(dados, etree.XMLParser(resolve_entities=False, no_network=True))
-    if esquema.validate(doc):
-        return []
-    return [f"{e.message} (linha {e.line})" for e in esquema.error_log]
+    # libxml2 armazena error_log na instância compartilhada do XMLSchema.
+    with _ESQUEMA_LOCK:
+        if esquema.validate(doc):
+            return []
+        return [f"{e.message} (linha {e.line})" for e in esquema.error_log]

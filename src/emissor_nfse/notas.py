@@ -53,7 +53,7 @@ def resumo_nfse(xml: str) -> dict:
         "total_retido": _xp(raiz, "infNFSe/valores/vTotalRet"),
         "valor_liquido": _xp(raiz, "infNFSe/valores/vLiq"),
         "iss_retido": _xp(raiz, "tribMun/tpRetISSQN") in ("2", "3"),
-        "ambiente": "producao" if _xp(raiz, "infNFSe/ambGer") == "1" or _xp(raiz, "infDPS/tpAmb") == "1" else "homologacao",
+        "ambiente": "producao" if _xp(raiz, "infDPS/tpAmb") == "1" else "homologacao",
     }
 
 
@@ -81,7 +81,7 @@ def carregar_indice(cnpj: str, ambiente: str) -> dict[str, dict]:
     return ler_json(_indice_arquivo(cnpj, ambiente), {})
 
 
-def guardar_nota(cnpj: str, ambiente: str, xml: str, origem: str) -> dict:
+def _preparar_xml_nota(cnpj: str, ambiente: str, xml: str, origem: str) -> dict:
     resumo = resumo_nfse(xml)
     chave = resumo["chave"]
     if not chave:
@@ -94,16 +94,42 @@ def guardar_nota(cnpj: str, ambiente: str, xml: str, origem: str) -> dict:
     (pasta / f"{nome}.xml").write_text(xml, encoding="utf-8")
     resumo["arquivo_xml"] = str((pasta / f"{nome}.xml").relative_to(pasta_dados()))
     resumo["origem"] = origem
+    return resumo
+
+
+def _mesclar_resumo(indice: dict[str, dict], resumo: dict) -> dict:
+    chave = resumo["chave"]
+    anterior = indice.get(chave, {})
+    resumo["situacao"] = anterior.get("situacao", "autorizada")
+    for campo in ("arquivo_pdf", "cancelada_em"):
+        if anterior.get(campo):
+            resumo[campo] = anterior[campo]
+    indice[chave] = resumo
+    return resumo
+
+
+def guardar_nota(cnpj: str, ambiente: str, xml: str, origem: str) -> dict:
+    resumo = _preparar_xml_nota(cnpj, ambiente, xml, origem)
     with trava(f"indice-{cnpj}"):
         indice = carregar_indice(cnpj, ambiente)
-        anterior = indice.get(chave, {})
-        resumo["situacao"] = anterior.get("situacao", "autorizada")
-        for campo in ("arquivo_pdf", "cancelada_em"):
-            if anterior.get(campo):
-                resumo[campo] = anterior[campo]
-        indice[chave] = resumo
+        _mesclar_resumo(indice, resumo)
         gravar_json(_indice_arquivo(cnpj, ambiente), indice)
     return resumo
+
+
+def aplicar_lote(cnpj: str, ambiente: str, acoes: list[tuple[str, dict]]) -> None:
+    """Grava no índice em uma única escrita todas as notas/eventos já preparados de uma página."""
+    if not acoes:
+        return
+    with trava(f"indice-{cnpj}"):
+        indice = carregar_indice(cnpj, ambiente)
+        for tipo, dados in acoes:
+            if tipo == "nota":
+                _mesclar_resumo(indice, dados)
+            elif tipo == "cancelamento":
+                item = indice.setdefault(dados["chave"], {"chave": dados["chave"]})
+                item.update(situacao="cancelada", cancelada_em=dados["data"])
+        gravar_json(_indice_arquivo(cnpj, ambiente), indice)
 
 
 def atualizar_nota(cnpj: str, ambiente: str, chave: str, **campos) -> None:
@@ -116,6 +142,10 @@ def atualizar_nota(cnpj: str, ambiente: str, chave: str, **campos) -> None:
 
 def caminho_pdf(cnpj: str, ambiente: str, chave: str) -> Path:
     item = carregar_indice(cnpj, ambiente).get(chave, {})
+    if item.get("arquivo_pdf"):
+        existente = pasta_dados() / item["arquivo_pdf"]
+        if existente.exists():
+            return existente
     if item.get("arquivo_xml"):
         return (pasta_dados() / item["arquivo_xml"]).with_suffix(".pdf")
     pasta = pasta_notas(cnpj, ambiente) / "pdf"

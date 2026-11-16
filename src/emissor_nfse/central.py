@@ -87,7 +87,7 @@ class Portaria:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            cabecalhos = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            cabecalhos = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
             if identificar(cabecalhos.get("authorization")) is None:
                 corpo = json.dumps({"erro": "chave de acesso ausente ou inválida"}).encode()
                 await send(

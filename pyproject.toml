@@ -24,8 +24,8 @@ emissor-nfse-admin = "emissor_nfse.admin:main"
 emissor-nfse-ponte = "emissor_nfse.ponte:main"
 
 [project.urls]
-Repository = "https://github.com/cleitoncampano/emissor-nfse"
-Issues = "https://github.com/cleitoncampano/emissor-nfse/issues"
+Repository = "https://github.com/cleitoncampano/emissor-nota-contabilidade"
+Issues = "https://github.com/cleitoncampano/emissor-nota-contabilidade/issues"
 
 [dependency-groups]
 dev = ["pytest>=8"]

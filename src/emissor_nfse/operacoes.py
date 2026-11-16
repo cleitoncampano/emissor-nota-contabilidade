@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -31,6 +32,7 @@ from .config import (
     salvar_escritorio,
     formatar_cnpj,
     gravar_json,
+    incrementar_notas_teste,
     ler_json,
     normalizar,
     pasta_dados,
@@ -58,6 +60,8 @@ from .dps import (
     validar_xsd,
 )
 from .notas import (
+    _preparar_xml_nota,
+    aplicar_lote,
     atualizar_nota,
     carregar_indice,
     caminho_pdf,
@@ -86,12 +90,25 @@ def _fabrica_padrao(empresa: Empresa, senha: str) -> ClienteSefin:
 fabrica_cliente: Callable[[Empresa, str], ClienteSefin] = _fabrica_padrao
 
 
-def _cliente(empresa: Empresa) -> ClienteSefin:
+def _cliente(empresa: Empresa, ambiente: Optional[str] = None) -> ClienteSefin:
     senha = cert.ler_senha(empresa.chave_cofre())
     if not senha:
         dono = "do escritório" if empresa.usa_procuracao else f"de {empresa.nome}"
         raise ErroNota(f"A senha do certificado {dono} não está guardada no computador do conector. Cadastre o certificado de novo.")
+    if ambiente and ambiente != empresa.ambiente:
+        empresa = empresa.model_copy(update={"ambiente": ambiente})
     return fabrica_cliente(empresa, senha)
+
+
+def _sessao(cliente):
+    return cliente if hasattr(cliente, "__enter__") else nullcontext(cliente)
+
+
+def _chave_50(chave: str) -> str:
+    d = so_digitos(chave)
+    if len(d) != 50:
+        raise ErroNota("A chave de acesso da NFS-e tem 50 dígitos.")
+    return d
 
 
 def validade_certificado(e: Empresa) -> Optional[str]:
@@ -178,7 +195,7 @@ def importar_pasta_certificados(pasta: str) -> str:
     base = Path(os.path.expanduser(pasta.strip().strip("'\"")))
     if not base.is_dir():
         raise ErroNota(f"{base} não é uma pasta.")
-    arquivos = sorted([*base.glob("*.pfx"), *base.glob("*.p12"), *base.glob("*.PFX"), *base.glob("*.P12")])
+    arquivos = sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in (".pfx", ".p12"))
     if not arquivos:
         return "Nenhum arquivo .pfx ou .p12 nessa pasta."
     resultados = []
@@ -309,26 +326,28 @@ def configurar_empresa(empresa_ref: str, campos: dict) -> str:
         )
     dados = empresa.model_dump()
     servico = dict(dados.get("servico_padrao") or {})
-    for chave, valor in campos.items():
-        if valor == "":
-            valor = None
-        if chave == "municipio":
-            dados["municipio_ibge"] = _resolver_municipio(valor)
-        elif chave == "codigo_servico":
-            servico["codigo_nacional"] = valor
-        elif chave == "codigo_municipal":
-            servico["codigo_municipal"] = valor
-        elif chave == "nbs":
-            servico["nbs"] = valor
-        elif chave == "descricao_padrao":
-            servico["descricao"] = valor
-        elif chave in ("aliquota_simples_total", "aliquota_iss_simples") or chave.startswith("tributos_aproximados"):
-            dados[chave] = dec(valor) if valor is not None else None
-        else:
-            dados[chave] = valor
-    dados["servico_padrao"] = ServicoPadrao(**servico)
     try:
+        for chave, valor in campos.items():
+            if valor == "":
+                valor = None
+            if chave == "municipio":
+                dados["municipio_ibge"] = _resolver_municipio(valor) if valor is not None else None
+            elif chave == "codigo_servico":
+                servico["codigo_nacional"] = valor
+            elif chave == "codigo_municipal":
+                servico["codigo_municipal"] = valor
+            elif chave == "nbs":
+                servico["nbs"] = valor
+            elif chave == "descricao_padrao":
+                servico["descricao"] = valor
+            elif chave in ("aliquota_simples_total", "aliquota_iss_simples") or chave.startswith("tributos_aproximados"):
+                dados[chave] = dec(valor) if valor is not None else None
+            else:
+                dados[chave] = valor
+        dados["servico_padrao"] = ServicoPadrao(**servico)
         nova = Empresa(**dados)
+    except ErroNota:
+        raise
     except Exception as e:
         raise ErroNota(f"Não salvei: {e}") from e
     cod = nova.servico_padrao.codigo_nacional
@@ -547,6 +566,15 @@ def preparar_nota(
     except Exception as ex:
         raise ErroNota(f"Valor não reconhecido: {valor}") from ex
 
+    retencoes_dec: dict[str, Decimal] = {}
+    for k, v in (retencoes or {}).items():
+        if v in (None, "", 0, "0"):
+            continue
+        try:
+            retencoes_dec[k.lower()] = dec(v)
+        except Exception as ex:
+            raise ErroNota(f"Percentual de {k.upper()} não reconhecido: {v}") from ex
+
     dados = DadosNota(
         tomador=Tomador(documento=doc, nome=nome, email=tomador_email or conhecido.get("email")),
         valor=valor_dec,
@@ -557,7 +585,7 @@ def preparar_nota(
         nbs=so_digitos(nbs) if nbs else (sp.nbs if not codigo_servico else None),
         municipio_prestacao=_resolver_municipio(municipio_prestacao) if municipio_prestacao else None,
         iss_retido=bool(iss_retido),
-        retencoes={k.lower(): dec(v) for k, v in (retencoes or {}).items() if v not in (None, "", 0, "0")},
+        retencoes=retencoes_dec,
         observacao=observacao,
     )
     calculo = conferir_regras(e, dados)
@@ -631,108 +659,119 @@ def preparar_nota(
 
 
 def emitir_nota(rascunho_id: str) -> str:
-    r = _ler_rascunho(rascunho_id)
-    if r.get("tipo") != "nota":
+    r0 = _ler_rascunho(rascunho_id)
+    if r0.get("tipo") != "nota":
         raise ErroNota("Esse código é de um cancelamento. Use cancelar_nota.")
-    if r["status"] == "emitida":
-        res = r.get("resultado", {})
-        return f"Essa prévia já virou a nota {res.get('numero')} (chave {res.get('chave')}). Nada foi emitido de novo."
-    if r["status"] in ("enviando", "desconhecido"):
-        return verificar_envio(rascunho_id)
-    if datetime.now() - datetime.fromisoformat(r["criado_em"]) > VALIDADE_RASCUNHO:
-        raise ErroNota("Essa prévia tem mais de 2 horas. Prepare a nota de novo para conferir os dados atualizados.")
 
-    e = achar_empresa(r["cnpj"])
-    if e.ambiente != r["ambiente"]:
-        raise ErroNota("O ambiente da empresa mudou depois da prévia. Prepare a nota de novo.")
-    dados = _dados_nota_de(r)
-    cliente = _cliente(e)
+    with trava(f"emissao-{r0['cnpj']}", espera_max=120):
+        r = _ler_rascunho(rascunho_id)
+        if r["status"] == "emitida":
+            res = r.get("resultado", {})
+            return f"Essa prévia já virou a nota {res.get('numero')} (chave {res.get('chave')}). Nada foi emitido de novo."
+        if r["status"] in ("enviando", "desconhecido"):
+            return _verificar_envio_travado(rascunho_id)
+        if r["status"] != "pendente":
+            raise ErroNota(f"Essa prévia já foi finalizada com situação '{r['status']}'. Prepare a nota de novo.")
+        if datetime.now() - datetime.fromisoformat(r["criado_em"]) > VALIDADE_RASCUNHO:
+            raise ErroNota("Essa prévia tem mais de 2 horas. Prepare a nota de novo para conferir os dados atualizados.")
 
-    with trava(f"emissao-{e.cnpj}", espera_max=120):
-        arquivo_num = pasta_dados() / "numeracao.json"
-        chave_num = f"{e.cnpj}|{e.ambiente}|{e.serie}"
-        numeracao = ler_json(arquivo_num, {})
-        numero = int(numeracao.get(chave_num, 0)) + 1
-        for _ in range(10):
+        e = achar_empresa(r["cnpj"])
+        if e.ambiente != r["ambiente"]:
+            raise ErroNota("O ambiente da empresa mudou depois da prévia. Prepare a nota de novo.")
+        dados = _dados_nota_de(r)
+        cliente = _cliente(e)
+
+        with _sessao(cliente):
+            arquivo_num = pasta_dados() / "numeracao.json"
+            chave_num = f"{e.cnpj}|{e.ambiente}|{e.serie}"
+            with trava("numeracao"):
+                numeracao = ler_json(arquivo_num, {})
+                numero = int(numeracao.get(chave_num, 0)) + 1
+            for _ in range(10):
+                try:
+                    ja_existe = cliente.has_nfse_by_dps(id_dps(e, numero))
+                except Exception:
+                    ja_existe = False
+                if not ja_existe:
+                    break
+                numero += 1
+            with trava("numeracao"):
+                numeracao = ler_json(arquivo_num, {})
+                numeracao[chave_num] = max(int(numeracao.get(chave_num, 0)), numero)
+                gravar_json(arquivo_num, numeracao)
+
+            def liberar_numero():
+                with trava("numeracao"):
+                    atual = ler_json(arquivo_num, {})
+                    if int(atual.get(chave_num, 0)) == numero:
+                        atual[chave_num] = numero - 1
+                        gravar_json(arquivo_num, atual)
+
             try:
-                ja_existe = cliente.has_nfse_by_dps(id_dps(e, numero))
+                xml = montar_dps(e, dados, numero, e.ambiente)
+                assinado = cliente.assinar(xml)
             except Exception:
-                ja_existe = False
-            if not ja_existe:
-                break
-            numero += 1
-        numeracao[chave_num] = numero
-        gravar_json(arquivo_num, numeracao)
+                liberar_numero()
+                raise
+            erros = validar_xsd(assinado)
+            if erros:
+                liberar_numero()
+                raise ErroNota("A nota assinada ficou fora do padrão oficial: " + "; ".join(erros[:3]))
 
-        def liberar_numero():
-            atual = ler_json(arquivo_num, {})
-            if int(atual.get(chave_num, 0)) == numero:
-                atual[chave_num] = numero - 1
-                gravar_json(arquivo_num, atual)
-
-        try:
-            xml = montar_dps(e, dados, numero, e.ambiente)
-            assinado = cliente.assinar(xml)
-        except Exception:
-            liberar_numero()
-            raise
-        erros = validar_xsd(assinado)
-        if erros:
-            liberar_numero()
-            raise ErroNota("A nota assinada ficou fora do padrão oficial: " + "; ".join(erros[:3]))
-
-        identificador = id_dps(e, numero)
-        r.update(status="enviando", numero_dps=numero, id_dps=identificador)
-        _salvar_rascunho(r)
-
-        try:
-            resposta = cliente.enviar_dps(assinado)
-        except NFSeError as ex:
-            r["erro_envio"] = _erro_api(ex)
-            r["status"] = "desconhecido"
+            identificador = id_dps(e, numero)
+            r.update(status="enviando", numero_dps=numero, id_dps=identificador)
             _salvar_rascunho(r)
-            registrar_historico("emissao_sem_resposta", cnpj=e.cnpj, ambiente=e.ambiente, id_dps=identificador, erro=r["erro_envio"])
-            return verificar_envio(rascunho_id)
 
-        if not resposta.success:
-            liberar_numero()
-            r.update(status="recusada", erro=f"{resposta.error_code}: {resposta.error_message}")
-            _salvar_rascunho(r)
-            registrar_historico(
-                "emissao_recusada", cnpj=e.cnpj, ambiente=e.ambiente, codigo=resposta.error_code, mensagem=resposta.error_message
-            )
-            return (
-                "O sistema nacional recusou a nota. Nada foi emitido.\n"
-                f"Motivo: {resposta.error_message} (código {resposta.error_code})\n"
-                "Corrija o dado indicado e prepare a nota de novo."
-            )
+            try:
+                resposta = cliente.enviar_dps(assinado)
+            except NFSeError as ex:
+                r["erro_envio"] = _erro_api(ex)
+                r["status"] = "desconhecido"
+                _salvar_rascunho(r)
+                registrar_historico("emissao_sem_resposta", cnpj=e.cnpj, ambiente=e.ambiente, id_dps=identificador, erro=r["erro_envio"])
+                return _verificar_envio_travado(rascunho_id, cliente=cliente)
 
-        return _concluir_emissao(e, r, resposta.chave_acesso, resposta.xml_nfse, resposta.nfse_number, cliente, dados)
+            if not resposta.success:
+                liberar_numero()
+                r.update(status="recusada", erro=f"{resposta.error_code}: {resposta.error_message}")
+                _salvar_rascunho(r)
+                registrar_historico(
+                    "emissao_recusada", cnpj=e.cnpj, ambiente=e.ambiente, codigo=resposta.error_code, mensagem=resposta.error_message
+                )
+                return (
+                    "O sistema nacional recusou a nota. Nada foi emitido.\n"
+                    f"Motivo: {resposta.error_message} (código {resposta.error_code})\n"
+                    "Corrija o dado indicado e prepare a nota de novo."
+                )
+
+            return _concluir_emissao(e, r, resposta.chave_acesso, resposta.xml_nfse, resposta.nfse_number, cliente, dados)
 
 
 def _concluir_emissao(e: Empresa, r: dict, chave: str, xml_nfse: Optional[str], numero, cliente, dados: DadosNota) -> str:
+    ambiente = r.get("ambiente") or e.ambiente
     resumo = {}
     if xml_nfse:
-        resumo = guardar_nota(e.cnpj, e.ambiente, xml_nfse, origem="claude")
+        resumo = guardar_nota(e.cnpj, ambiente, xml_nfse, origem="claude")
     else:
-        atualizar_nota(e.cnpj, e.ambiente, chave, numero=numero, situacao="autorizada", origem="claude")
+        atualizar_nota(e.cnpj, ambiente, chave, numero=numero, situacao="autorizada", origem="claude")
     numero = resumo.get("numero") or numero
     r.update(status="emitida", resultado={"chave": chave, "numero": numero})
     _salvar_rascunho(r)
     _lembrar_tomador(e.cnpj, dados.tomador)
-    if e.ambiente == "homologacao":
-        e.notas_teste_ok += 1
-        salvar_empresa(e)
+    if ambiente == "homologacao":
+        incrementar_notas_teste(e.cnpj)
     registrar_historico(
-        "emissao", cnpj=e.cnpj, ambiente=e.ambiente, numero=numero, chave=chave, valor=str(dados.valor), tomador=dados.tomador.documento
+        "emissao", cnpj=e.cnpj, ambiente=ambiente, numero=numero, chave=chave, valor=str(dados.valor), tomador=dados.tomador.documento
     )
     pdf = None
     try:
+        if ambiente != e.ambiente:
+            e = e.model_copy(update={"ambiente": ambiente})
         pdf = _obter_pdf(e, chave, cliente)
     except Exception:
         pass
 
-    l = [("Nota de TESTE emitida" if e.ambiente == "homologacao" else "Nota emitida") + f": número {numero}"]
+    l = [("Nota de TESTE emitida" if ambiente == "homologacao" else "Nota emitida") + f": número {numero}"]
     l.append(f"Pedido por: {pessoa_atual.get().nome}")
     l.append(f"Chave de acesso: {chave}")
     if resumo.get("valor_iss"):
@@ -746,8 +785,7 @@ def _concluir_emissao(e: Empresa, r: dict, chave: str, xml_nfse: Optional[str], 
     return "\n".join(l)
 
 
-def verificar_envio(rascunho_id: str) -> str:
-    """Para quando o envio ficou sem resposta: pergunta ao governo se a nota foi gerada."""
+def _verificar_envio_travado(rascunho_id: str, cliente=None) -> str:
     r = _ler_rascunho(rascunho_id)
     if r["status"] == "emitida":
         res = r.get("resultado", {})
@@ -755,11 +793,14 @@ def verificar_envio(rascunho_id: str) -> str:
     if r["status"] not in ("enviando", "desconhecido"):
         return f"Essa prévia está com situação '{r['status']}'."
     e = achar_empresa(r["cnpj"])
-    cliente = _cliente(e)
-    resultado = cliente.recover_nfse_by_dps(r["id_dps"])
-    if resultado.status == "success":
-        q = resultado.result
-        return _concluir_emissao(e, r, q.chave_acesso, q.xml_nfse, q.nfse_number, cliente, _dados_nota_de(r))
+    ambiente = r.get("ambiente") or e.ambiente
+    if cliente is None:
+        cliente = _cliente(e, ambiente=ambiente)
+    with _sessao(cliente):
+        resultado = cliente.recover_nfse_by_dps(r["id_dps"])
+        if resultado.status == "success":
+            q = resultado.result
+            return _concluir_emissao(e, r, q.chave_acesso, q.xml_nfse, q.nfse_number, cliente, _dados_nota_de(r))
     if resultado.status == "processing":
         return (
             "O governo ainda não confirma a nota dessa prévia. Não emita de novo. "
@@ -770,6 +811,13 @@ def verificar_envio(rascunho_id: str) -> str:
         f"({_erro_api(resultado.error) if resultado.error else 'sem detalhe'}). Não emita de novo; "
         f"tente verificar o envio {r['id']} mais tarde."
     )
+
+
+def verificar_envio(rascunho_id: str) -> str:
+    """Para quando o envio ficou sem resposta: pergunta ao governo se a nota foi gerada."""
+    r = _ler_rascunho(rascunho_id)
+    with trava(f"emissao-{r['cnpj']}", espera_max=120):
+        return _verificar_envio_travado(rascunho_id)
 
 
 # ---------------------------------------------------------------- consulta e PDF
@@ -803,7 +851,7 @@ def _obter_pdf(e: Empresa, chave: str, cliente=None) -> Optional[str]:
 
 def baixar_pdf(empresa_ref: str, chave: str) -> str:
     e = achar_empresa(empresa_ref)
-    caminho = _obter_pdf(e, so_digitos(chave))
+    caminho = _obter_pdf(e, _chave_50(chave))
     if not caminho:
         return "O governo não entregou o PDF agora e não tenho o XML dessa nota para gerar localmente. Tente mais tarde."
     return f"PDF salvo em: {caminho}"
@@ -811,12 +859,37 @@ def baixar_pdf(empresa_ref: str, chave: str) -> str:
 
 def consultar_nota(empresa_ref: str, chave: str) -> str:
     e = achar_empresa(empresa_ref)
-    chave = so_digitos(chave)
+    chave = _chave_50(chave)
     cliente = _cliente(e)
     try:
-        q = cliente.query_nfse(chave)
+        with _sessao(cliente):
+            q = cliente.query_nfse(chave)
+        cancelada = bool(q.status and "cancel" in q.status.lower())
         if q.xml_nfse:
-            guardar_nota(e.cnpj, e.ambiente, q.xml_nfse, origem=carregar_indice(e.cnpj, e.ambiente).get(chave, {}).get("origem", "consulta"))
+            origem = carregar_indice(e.cnpj, e.ambiente).get(chave, {}).get("origem", "consulta")
+            guardar_nota(e.cnpj, e.ambiente, q.xml_nfse, origem=origem)
+            if cancelada:
+                atualizar_nota(e.cnpj, e.ambiente, chave, situacao="cancelada")
+        else:
+            local = carregar_indice(e.cnpj, e.ambiente).get(chave)
+            situacao = "cancelada" if cancelada else (q.status or "autorizada")
+            if local:
+                atualizar_nota(e.cnpj, e.ambiente, chave, situacao=situacao)
+            else:
+                emitida = q.data_emissao.isoformat() if hasattr(q.data_emissao, "isoformat") else str(q.data_emissao)
+                atualizar_nota(
+                    e.cnpj,
+                    e.ambiente,
+                    chave,
+                    numero=q.nfse_number,
+                    situacao=situacao,
+                    emitida_em=emitida,
+                    valor=str(q.valor_servicos),
+                    prestador_cnpj=q.prestador_cnpj,
+                    tomador_documento=q.tomador_documento,
+                    papel="emitida" if q.prestador_cnpj == e.cnpj else "recebida",
+                    origem="consulta",
+                )
     except NFSeError as ex:
         local = carregar_indice(e.cnpj, e.ambiente).get(chave)
         if not local:
@@ -880,34 +953,36 @@ def preparar_cancelamento(empresa_ref: str, chave: str, motivo_codigo: int, just
 
 
 def cancelar_nota(rascunho_id: str) -> str:
-    r = _ler_rascunho(rascunho_id)
-    if r.get("tipo") != "cancelamento":
+    r0 = _ler_rascunho(rascunho_id)
+    if r0.get("tipo") != "cancelamento":
         raise ErroNota("Esse código é de uma nota, não de um cancelamento.")
-    if r["status"] == "cancelada":
-        return "Esse cancelamento já foi feito."
-    if datetime.now() - datetime.fromisoformat(r["criado_em"]) > VALIDADE_RASCUNHO:
-        raise ErroNota("Essa prévia tem mais de 2 horas. Prepare o cancelamento de novo.")
-    e = achar_empresa(r["cnpj"])
-    if e.ambiente != r["ambiente"]:
-        raise ErroNota("O ambiente da empresa mudou depois da prévia. Prepare de novo.")
-    cliente = _cliente(e)
-    xml = montar_cancelamento(e, r["chave"], r["motivo_codigo"], r["justificativa"], e.ambiente)
-    assinado = cliente.assinar(xml)
-    erros = validar_xsd(assinado, tipo="evento")
-    if erros:
-        raise ErroNota("O pedido de cancelamento ficou fora do padrão oficial: " + "; ".join(erros[:3]))
-    try:
-        resposta = cliente.registrar_evento(r["chave"], assinado)
-    except NFSeError as ex:
-        raise ErroNota(f"Sem resposta do governo ao cancelar ({_erro_api(ex)}). Consulte a nota antes de tentar de novo.") from ex
-    if not resposta.success:
-        registrar_historico("cancelamento_recusado", cnpj=e.cnpj, chave=r["chave"], codigo=resposta.error_code, mensagem=resposta.error_message)
-        return f"O governo recusou o cancelamento: {resposta.error_message} (código {resposta.error_code})."
-    r["status"] = "cancelada"
-    _salvar_rascunho(r)
-    atualizar_nota(e.cnpj, e.ambiente, r["chave"], situacao="cancelada", cancelada_em=datetime.now().isoformat(timespec="seconds"))
-    registrar_historico("cancelamento", cnpj=e.cnpj, ambiente=e.ambiente, chave=r["chave"], protocolo=resposta.protocolo)
-    return f"Nota cancelada. Protocolo: {resposta.protocolo or 'registrado'}."
+    with trava(f"cancelamento-{r0['id']}", espera_max=120):
+        r = _ler_rascunho(rascunho_id)
+        if r["status"] == "cancelada":
+            return "Esse cancelamento já foi feito."
+        if datetime.now() - datetime.fromisoformat(r["criado_em"]) > VALIDADE_RASCUNHO:
+            raise ErroNota("Essa prévia tem mais de 2 horas. Prepare o cancelamento de novo.")
+        e = achar_empresa(r["cnpj"])
+        if e.ambiente != r["ambiente"]:
+            raise ErroNota("O ambiente da empresa mudou depois da prévia. Prepare de novo.")
+        cliente = _cliente(e)
+        xml = montar_cancelamento(e, r["chave"], r["motivo_codigo"], r["justificativa"], e.ambiente)
+        assinado = cliente.assinar(xml)
+        erros = validar_xsd(assinado, tipo="evento")
+        if erros:
+            raise ErroNota("O pedido de cancelamento ficou fora do padrão oficial: " + "; ".join(erros[:3]))
+        try:
+            resposta = cliente.registrar_evento(r["chave"], assinado)
+        except NFSeError as ex:
+            raise ErroNota(f"Sem resposta do governo ao cancelar ({_erro_api(ex)}). Consulte a nota antes de tentar de novo.") from ex
+        if not resposta.success:
+            registrar_historico("cancelamento_recusado", cnpj=e.cnpj, chave=r["chave"], codigo=resposta.error_code, mensagem=resposta.error_message)
+            return f"O governo recusou o cancelamento: {resposta.error_message} (código {resposta.error_code})."
+        r["status"] = "cancelada"
+        _salvar_rascunho(r)
+        atualizar_nota(e.cnpj, e.ambiente, r["chave"], situacao="cancelada", cancelada_em=datetime.now().isoformat(timespec="seconds"))
+        registrar_historico("cancelamento", cnpj=e.cnpj, ambiente=e.ambiente, chave=r["chave"], protocolo=resposta.protocolo)
+        return f"Nota cancelada. Protocolo: {resposta.protocolo or 'registrado'}."
 
 
 # ---------------------------------------------------------------- notas do período
@@ -920,37 +995,42 @@ def sincronizar(e: Empresa, max_paginas: int = 30) -> tuple[int, list[str]]:
     novos = 0
     avisos: list[str] = []
     with trava(f"sinc-{e.cnpj}", espera_max=120):
-        ultimo = int(ler_json(arquivo, {}).get(chave_nsu, 0))
-        for _ in range(max_paginas):
-            situacao, docs, mensagens = cliente.distribuicao(ultimo)
-            avisos.extend(mensagens)
-            if situacao != "ok":
-                if situacao == "erro":
-                    avisos.append("Não consegui atualizar a lista de notas pelo ambiente nacional agora.")
-                break
-            progresso = False
-            for doc in sorted(docs, key=lambda d: d.nsu):
-                if doc.nsu <= ultimo:
-                    continue
-                progresso = True
-                ultimo = doc.nsu
-                if not doc.xml:
-                    continue
-                try:
-                    if "infNFSe" in doc.xml:
-                        guardar_nota(e.cnpj, e.ambiente, doc.xml, origem="nacional")
-                        novos += 1
-                    elif "infEvento" in doc.xml or "pedRegEvento" in doc.xml:
-                        ev = resumo_evento(doc.xml)
-                        if ev["cancelamento"] and ev["chave"]:
-                            atualizar_nota(e.cnpj, e.ambiente, ev["chave"], situacao="cancelada", cancelada_em=ev["data"])
-                except Exception as ex:
-                    avisos.append(f"Documento NSU {doc.nsu} não pôde ser lido ({ex}).")
-            dados = ler_json(arquivo, {})
-            dados[chave_nsu] = ultimo
-            gravar_json(arquivo, dados)
-            if not progresso:
-                break
+        with trava("adn_nsu"):
+            ultimo = int(ler_json(arquivo, {}).get(chave_nsu, 0))
+        with _sessao(cliente):
+            for _ in range(max_paginas):
+                situacao, docs, mensagens = cliente.distribuicao(ultimo)
+                avisos.extend(mensagens)
+                if situacao != "ok":
+                    if situacao == "erro":
+                        avisos.append("Não consegui atualizar a lista de notas pelo ambiente nacional agora.")
+                    break
+                progresso = False
+                acoes: list[tuple[str, dict]] = []
+                for doc in sorted(docs, key=lambda d: d.nsu):
+                    if doc.nsu <= ultimo:
+                        continue
+                    progresso = True
+                    ultimo = doc.nsu
+                    if not doc.xml:
+                        continue
+                    try:
+                        if "infNFSe" in doc.xml:
+                            acoes.append(("nota", _preparar_xml_nota(e.cnpj, e.ambiente, doc.xml, origem="nacional")))
+                            novos += 1
+                        elif "infEvento" in doc.xml or "pedRegEvento" in doc.xml:
+                            ev = resumo_evento(doc.xml)
+                            if ev["cancelamento"] and ev["chave"]:
+                                acoes.append(("cancelamento", ev))
+                    except Exception as ex:
+                        avisos.append(f"Documento NSU {doc.nsu} não pôde ser lido ({ex}).")
+                aplicar_lote(e.cnpj, e.ambiente, acoes)
+                with trava("adn_nsu"):
+                    dados = ler_json(arquivo, {})
+                    dados[chave_nsu] = ultimo
+                    gravar_json(arquivo, dados)
+                if not progresso:
+                    break
     return novos, avisos
 
 
@@ -961,6 +1041,16 @@ def listar_notas(
     tipo: str = "emitidas",
     atualizar: bool = True,
 ) -> str:
+    if tipo not in ("emitidas", "recebidas", "todas"):
+        raise ErroNota("Tipo deve ser 'emitidas', 'recebidas' ou 'todas'.")
+    hoje = date.today()
+    de = de or hoje.replace(day=1).isoformat()
+    ate = ate or hoje.isoformat()
+    try:
+        de_dt = date.fromisoformat(de)
+        ate_dt = date.fromisoformat(ate)
+    except ValueError as ex:
+        raise ErroNota("Use as datas no formato AAAA-MM-DD (ex.: 2026-11-01).") from ex
     if empresa_ref:
         alvos = [achar_empresa(empresa_ref)]
     else:
@@ -968,9 +1058,6 @@ def listar_notas(
         if len(alvos) > 10:
             return "São mais de 10 empresas. Diga quais (até 10 por pergunta) ou consulte uma de cada vez."
     papel = {"emitidas": "emitida", "recebidas": "recebida"}.get(tipo)
-    hoje = date.today()
-    de = de or hoje.replace(day=1).isoformat()
-    ate = ate or hoje.isoformat()
     blocos = []
     total_geral = Decimal("0")
     for e in alvos:
@@ -1004,7 +1091,7 @@ def listar_notas(
             linhas.append(f"  ... e mais {len(itens) - 40}")
         linhas.extend(f"  aviso: {a}" for a in avisos[:3])
         blocos.append("\n".join(linhas))
-    periodo = f"Período: {date.fromisoformat(de).strftime('%d/%m/%Y')} a {date.fromisoformat(ate).strftime('%d/%m/%Y')}"
+    periodo = f"Período: {de_dt.strftime('%d/%m/%Y')} a {ate_dt.strftime('%d/%m/%Y')}"
     rodape = f"\nTotal de todas as empresas: {reais(total_geral)}" if len(alvos) > 1 else ""
     return periodo + "\n\n" + "\n\n".join(blocos) + rodape
 
@@ -1037,8 +1124,10 @@ def pendencias() -> str:
             elif dias <= 30:
                 itens.insert(0, f"Certificado do escritório vence em {dias} dias. Ele atende todos os clientes por procuração.")
     for arq in sorted((pasta_dados() / "rascunhos").glob("*.json")) if (pasta_dados() / "rascunhos").exists() else []:
+        if arq.name.startswith(".tmp-"):
+            continue
         r = ler_json(arq, {})
-        if r.get("status") in ("enviando", "desconhecido"):
+        if r.get("status") in ("enviando", "desconhecido") and r.get("id"):
             nome = empresas.get(r.get("cnpj"), None)
             itens.append(
                 f"{nome.nome if nome else r.get('cnpj')}: envio {r['id']} sem confirmação do governo. Use verificar_envio antes de emitir de novo."

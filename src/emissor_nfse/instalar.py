@@ -39,7 +39,7 @@ def registrar(modo: str, uv: str) -> Path:
     comando = "emissor-nfse-ponte" if modo == "ponte" else "emissor-nfse-mcp"
     config.setdefault("mcpServers", {})["emissor-nfse"] = {
         "command": str(Path(uv).resolve()),
-        "args": ["run", "--directory", str(RAIZ_PROJETO), comando],
+        "args": ["run", "--locked", "--no-dev", "--directory", str(RAIZ_PROJETO), comando],
     }
     arquivo.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     return arquivo

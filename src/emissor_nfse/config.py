@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 import unicodedata
+import uuid
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -80,7 +81,7 @@ def formatar_cnpj(cnpj: str) -> str:
 
 
 def reais(valor: Decimal | float | int | str | None) -> str:
-    if valor is None:
+    if valor is None or valor == "":
         return "-"
     v = Decimal(str(valor)).quantize(Decimal("0.01"))
     inteiro, _, centavos = f"{v:.2f}".partition(".")
@@ -107,7 +108,14 @@ def gravar_json(caminho: Path, dados) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(dados, f, ensure_ascii=False, indent=2, default=str)
-        os.replace(tmp, caminho)
+        for tentativa in range(5):
+            try:
+                os.replace(tmp, caminho)
+                break
+            except PermissionError:
+                if tentativa == 4:
+                    raise
+                time.sleep(0.02)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -120,16 +128,20 @@ def gravar_json(caminho: Path, dados) -> None:
 def trava(nome: str, espera_max: float = 30.0):
     """Trava simples entre processos (Claude Desktop e Claude Code podem rodar juntos)."""
     caminho = pasta_dados() / f".{nome}.lock"
+    token = f"{os.getpid()}:{uuid.uuid4().hex}".encode()
+    expira_em = max(300.0, espera_max * 2)
     inicio = time.monotonic()
     while True:
         try:
             fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
+            try:
+                os.write(fd, token)
+            finally:
+                os.close(fd)
             break
         except FileExistsError:
             try:
-                if time.time() - caminho.stat().st_mtime > 120:
+                if time.time() - caminho.stat().st_mtime > expira_em:
                     caminho.unlink(missing_ok=True)
                     continue
             except FileNotFoundError:
@@ -140,7 +152,11 @@ def trava(nome: str, espera_max: float = 30.0):
     try:
         yield
     finally:
-        caminho.unlink(missing_ok=True)
+        try:
+            if caminho.read_bytes() == token:
+                caminho.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
 
 
 class ServicoPadrao(BaseModel):
@@ -276,6 +292,16 @@ def salvar_empresa(empresa: Empresa) -> None:
         bruto = ler_json(_arquivo_empresas(), {})
         bruto[empresa.cnpj] = empresa.model_dump(mode="json")
         gravar_json(_arquivo_empresas(), bruto)
+
+
+def incrementar_notas_teste(cnpj: str) -> None:
+    with trava("empresas"):
+        bruto = ler_json(_arquivo_empresas(), {})
+        if cnpj in bruto:
+            empresa = Empresa(**bruto[cnpj])
+            empresa.notas_teste_ok += 1
+            bruto[cnpj] = empresa.model_dump(mode="json")
+            gravar_json(_arquivo_empresas(), bruto)
 
 
 def remover_empresa(cnpj: str) -> None:

@@ -103,7 +103,18 @@ def _instalar_servico(porta: int) -> None:
     log = pasta_servidor() / "servidor.log"
     plist = {
         "Label": ROTULO_SERVICO,
-        "ProgramArguments": [uv, "run", "--directory", str(RAIZ_PROJETO), "emissor-nfse-admin", "servidor", "--porta", str(porta)],
+        "ProgramArguments": [
+            uv,
+            "run",
+            "--locked",
+            "--no-dev",
+            "--directory",
+            str(RAIZ_PROJETO),
+            "emissor-nfse-admin",
+            "servidor",
+            "--porta",
+            str(porta),
+        ],
         "EnvironmentVariables": {"EMISSOR_NFSE_DADOS": str(pasta_dados())},
         "RunAtLoad": True,
         "KeepAlive": True,

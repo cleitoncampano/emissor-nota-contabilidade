@@ -1,4 +1,4 @@
-# Emissor NFS-e Nacional via MCP
+# Emissor de notas para contabilidade
 
 Conector para escritórios contábeis emitirem, consultarem e cancelarem NFS-e Nacional pelo Claude Desktop ou outro cliente MCP. Um computador central Windows guarda os certificados dos clientes; cada pessoa da equipe acessa com uma chave própria.
 
@@ -107,8 +107,8 @@ Faça backup privado dessa pasta. Ela e os convites nunca devem entrar no GitHub
 ## Desenvolvimento e testes
 
 ```bash
-git clone https://github.com/cleitoncampano/emissor-nfse.git
-cd emissor-nfse
+git clone https://github.com/cleitoncampano/emissor-nota-contabilidade.git
+cd emissor-nota-contabilidade
 uv sync --locked --group dev
 uv run --locked --group dev pytest -q
 uv build --no-sources
