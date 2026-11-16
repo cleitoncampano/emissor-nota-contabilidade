@@ -1,0 +1,49 @@
+[project]
+name = "emissor-nfse"
+version = "0.2.0"
+description = "Servidor MCP para emissão e consulta de NFS-e Nacional por equipes e múltiplas empresas"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = [
+    "pynfse-nacional[pdf]==0.9.5",
+    "mcp>=2.3,<3",
+    "keyring>=25",
+    "lxml>=5.3",
+    "cryptography>=42",
+    "httpx>=0.27",
+    "httpx2>=2.16",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+emissor-nfse-mcp = "emissor_nfse.server:main"
+emissor-nfse-cadastro = "emissor_nfse.cadastro:main"
+emissor-nfse-admin = "emissor_nfse.admin:main"
+emissor-nfse-ponte = "emissor_nfse.ponte:main"
+
+[project.urls]
+Repository = "https://github.com/cleitoncampano/emissor-nfse"
+Issues = "https://github.com/cleitoncampano/emissor-nfse/issues"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emissor_nfse"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src", "/tests", "/scripts", "/docs", "/.github", "/.python-version",
+    "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/CONTRIBUTING.md",
+    "/SECURITY.md", "/pyproject.toml", "/uv.lock", "/instalar-*.command",
+    "/instalar-*.ps1", "/instalar-*.cmd",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
