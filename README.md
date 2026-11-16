@@ -139,7 +139,6 @@ Variáveis opcionais (o programa não carrega `.env` automaticamente):
 - Se o computador central suspender, desligar ou encerrar a sessão, a equipe perde a conexão.
 - Emite NFS-e. IBS/CBS, obra, exportação, deduções e benefícios municipais ainda não são preenchidos.
 - Ainda falta a primeira validação real com o governo, incluindo assinatura, distribuição ADN, PDF e procuração/cancelamento.
-- Os testes automatizados de Windows só terão resultado após executar o workflow no GitHub; o desenvolvimento local foi feito em um Mac.
 
 ## Contribuir e publicar
 

@@ -45,3 +45,6 @@ echo %~2
 } finally {
     Remove-Item -LiteralPath $temporario -Recurse -Force -ErrorAction SilentlyContinue
 }
+# O teste negativo acima deixa LASTEXITCODE diferente de zero. Uma excecao real
+# interrompe o script antes deste ponto; todos os testes aprovados encerram com sucesso.
+exit 0
